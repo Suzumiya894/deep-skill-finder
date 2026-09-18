@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -629,6 +630,313 @@ class SkillFeedbackTests(unittest.TestCase):
                 exit_code = skill_feedback._command_upload(args)
 
             self.assertEqual(3, exit_code)
+
+    # ---- attachment tests ----
+
+    def _make_small_attachment(self, temp_dir: str, size: int = 100, suffix: str = ".png") -> Path:
+        path = Path(temp_dir) / f"attachment{suffix}"
+        path.write_bytes(b"x" * size)
+        return path
+
+    def _make_large_attachment(self, temp_dir: str, size: int = 60 * 1024, suffix: str = ".mp4") -> Path:
+        path = Path(temp_dir) / f"attachment{suffix}"
+        path.write_bytes(b"y" * size)
+        return path
+
+    def test_validation_accepts_valid_inline_attachment(self):
+        draft = self._make_valid_payload()
+        draft["schemaVersion"] = "1.5"
+        draft["attachments"] = [
+            {
+                "type": "inline",
+                "name": "screenshot.png",
+                "mimeType": "image/png",
+                "size": 100,
+                "sha256": "a" * 64,
+                "data": "aGVsbG8=",
+            }
+        ]
+
+        self.assertEqual([], skill_feedback.validate_payload(draft))
+
+    def test_validation_accepts_valid_storage_attachment(self):
+        draft = self._make_valid_payload()
+        draft["schemaVersion"] = "1.5"
+        draft["attachments"] = [
+            {
+                "type": "storage",
+                "name": "recording.mp4",
+                "mimeType": "video/mp4",
+                "size": 102400,
+                "sha256": "b" * 64,
+                "storageKey": "attachments/2026/09/17/f/recording.mp4",
+            }
+        ]
+
+        self.assertEqual([], skill_feedback.validate_payload(draft))
+
+    def test_validation_rejects_invalid_attachment_type(self):
+        draft = self._make_valid_payload()
+        draft["schemaVersion"] = "1.5"
+        draft["attachments"] = [
+            {
+                "type": "unknown",
+                "name": "file.txt",
+                "mimeType": "text/plain",
+                "size": 100,
+                "sha256": "c" * 64,
+            }
+        ]
+
+        errors = skill_feedback.validate_payload(draft)
+        self.assertTrue(any("type must be 'inline' or 'storage'" in error for error in errors))
+        self.assertTrue(any("mimeType must be image/* or video/*" in error for error in errors))
+
+    def test_validation_rejects_attachment_with_bad_sha256(self):
+        draft = self._make_valid_payload()
+        draft["schemaVersion"] = "1.5"
+        draft["attachments"] = [
+            {
+                "type": "inline",
+                "name": "screenshot.png",
+                "mimeType": "image/png",
+                "size": 100,
+                "sha256": "too-short",
+                "data": "aGVsbG8=",
+            }
+        ]
+
+        errors = skill_feedback.validate_payload(draft)
+        self.assertTrue(any("sha256 must be a 64-character" in error for error in errors))
+
+    def test_validation_rejects_inline_attachment_without_data(self):
+        draft = self._make_valid_payload()
+        draft["schemaVersion"] = "1.5"
+        draft["attachments"] = [
+            {
+                "type": "inline",
+                "name": "screenshot.png",
+                "mimeType": "image/png",
+                "size": 100,
+                "sha256": "d" * 64,
+            }
+        ]
+
+        errors = skill_feedback.validate_payload(draft)
+        self.assertTrue(any("data is required for inline attachments" in error for error in errors))
+
+    def test_submit_with_small_attachment_inlines_and_saves(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            draft_path = Path(temp_dir) / "draft.json"
+            outbox_path = Path(temp_dir) / "outbox.jsonl"
+            attachment_path = self._make_small_attachment(temp_dir, size=100)
+
+            payload = self._make_valid_payload()
+            payload["schemaVersion"] = "1.5"
+            draft_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            args = argparse.Namespace(
+                confirmed=True,
+                input=str(draft_path),
+                outbox=str(outbox_path),
+                attachment=[str(attachment_path)],
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                exit_code = skill_feedback._command_submit(args)
+
+            self.assertEqual(0, exit_code)
+            record = json.loads(outbox_path.read_text(encoding="utf-8"))
+            self.assertEqual(1, len(record["payload"]["attachments"]))
+            self.assertEqual("inline", record["payload"]["attachments"][0]["type"])
+            self.assertEqual("attachment.png", record["payload"]["attachments"][0]["name"])
+            self.assertIn("data", record["payload"]["attachments"][0])
+
+    def test_submit_rejects_large_attachment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            draft_path = Path(temp_dir) / "draft.json"
+            outbox_path = Path(temp_dir) / "outbox.jsonl"
+            attachment_path = self._make_large_attachment(temp_dir)
+
+            payload = self._make_valid_payload()
+            payload["schemaVersion"] = "1.5"
+            draft_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            args = argparse.Namespace(
+                confirmed=True,
+                input=str(draft_path),
+                outbox=str(outbox_path),
+                attachment=[str(attachment_path)],
+            )
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                exit_code = skill_feedback._command_submit(args)
+
+            self.assertEqual(2, exit_code)
+            self.assertFalse(outbox_path.exists())
+
+    def test_upload_with_small_attachment_inlines(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            draft_path = Path(temp_dir) / "draft.json"
+            attachment_path = self._make_small_attachment(temp_dir, size=100)
+            payload = self._make_valid_payload()
+            payload["schemaVersion"] = "1.5"
+            draft_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            fake_resp = mock.MagicMock()
+            fake_resp.status = 200
+            fake_resp.read.return_value = json.dumps({"ok": True}).encode()
+            fake_resp.__enter__ = mock.MagicMock(return_value=fake_resp)
+            fake_resp.__exit__ = mock.MagicMock(return_value=False)
+
+            with mock.patch.object(
+                skill_feedback.urllib.request,
+                "urlopen",
+                return_value=fake_resp,
+            ) as mock_urlopen, contextlib.redirect_stdout(io.StringIO()):
+                args = argparse.Namespace(
+                    confirmed=True,
+                    input=str(draft_path),
+                    outbox=None,
+                    attachment=[str(attachment_path)],
+                )
+                exit_code = skill_feedback._command_upload(args)
+
+            self.assertEqual(0, exit_code)
+            req = mock_urlopen.call_args[0][0]
+            sent_body = json.loads(req.data)
+            self.assertEqual(1, len(sent_body["attachments"]))
+            self.assertEqual("inline", sent_body["attachments"][0]["type"])
+
+    def test_upload_with_large_attachment_uses_server_relay(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            draft_path = Path(temp_dir) / "draft.json"
+            attachment_path = self._make_large_attachment(temp_dir)
+            file_sha256 = hashlib.sha256(attachment_path.read_bytes()).hexdigest()
+            payload = self._make_valid_payload()
+            payload["schemaVersion"] = "1.5"
+            draft_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            upload_response = {
+                "code": 200,
+                "data": {
+                    "storageKey": "skill-feedback-attachments/2026/09/18/client-id/fb-001/recording.mp4",
+                    "url": "https://mss.sankuai.com/mars-open-image/skill-feedback-attachments/2026/09/18/client-id/fb-001/recording.mp4",
+                    "name": "recording.mp4",
+                    "mimeType": "video/mp4",
+                    "size": 61440,
+                    "sha256": file_sha256,
+                },
+            }
+
+            feedback_resp = mock.MagicMock()
+            feedback_resp.status = 200
+            feedback_resp.read.return_value = json.dumps({"ok": True}).encode()
+            feedback_resp.__enter__ = mock.MagicMock(return_value=feedback_resp)
+            feedback_resp.__exit__ = mock.MagicMock(return_value=False)
+
+            upload_url = skill_feedback.FEEDBACK_API_URL + skill_feedback.ATTACHMENT_UPLOAD_PATH
+
+            def urlopen_side_effect(req, **kwargs):
+                if req.full_url == upload_url:
+                    upload_mock = mock.MagicMock()
+                    upload_mock.status = 200
+                    upload_mock.read.return_value = json.dumps(upload_response).encode()
+                    upload_mock.__enter__ = mock.MagicMock(return_value=upload_mock)
+                    upload_mock.__exit__ = mock.MagicMock(return_value=False)
+                    return upload_mock
+                return feedback_resp
+
+            with mock.patch.object(
+                skill_feedback.urllib.request,
+                "urlopen",
+                side_effect=urlopen_side_effect,
+            ) as mock_urlopen, contextlib.redirect_stdout(io.StringIO()):
+                args = argparse.Namespace(
+                    confirmed=True,
+                    input=str(draft_path),
+                    outbox=None,
+                    attachment=[str(attachment_path)],
+                )
+                exit_code = skill_feedback._command_upload(args)
+
+            self.assertEqual(0, exit_code)
+            # Find the feedback request
+            feedback_calls = [
+                call for call in mock_urlopen.call_args_list
+                if call.args[0].full_url == skill_feedback.FEEDBACK_API_URL
+            ]
+            self.assertEqual(1, len(feedback_calls))
+            sent_body = json.loads(feedback_calls[0].args[0].data)
+            self.assertEqual(1, len(sent_body["attachments"]))
+            self.assertEqual("storage", sent_body["attachments"][0]["type"])
+            self.assertEqual(
+                "skill-feedback-attachments/2026/09/18/client-id/fb-001/recording.mp4",
+                sent_body["attachments"][0]["storageKey"],
+            )
+            self.assertEqual("video/mp4", sent_body["attachments"][0]["mimeType"])
+
+    def test_upload_attachment_not_found_returns_two(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            draft_path = Path(temp_dir) / "draft.json"
+            payload = self._make_valid_payload()
+            payload["schemaVersion"] = "1.5"
+            draft_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            args = argparse.Namespace(
+                confirmed=True,
+                input=str(draft_path),
+                outbox=None,
+                attachment=["/nonexistent/path/screenshot.png"],
+            )
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                exit_code = skill_feedback._command_upload(args)
+
+            self.assertEqual(2, exit_code)
+
+    def test_upload_rejects_non_image_video_attachment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            draft_path = Path(temp_dir) / "draft.json"
+            attachment_path = Path(temp_dir) / "notes.txt"
+            attachment_path.write_text("plain text", encoding="utf-8")
+            payload = self._make_valid_payload()
+            payload["schemaVersion"] = "1.5"
+            draft_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            args = argparse.Namespace(
+                confirmed=True,
+                input=str(draft_path),
+                outbox=None,
+                attachment=[str(attachment_path)],
+            )
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                exit_code = skill_feedback._command_upload(args)
+
+            self.assertEqual(2, exit_code)
+
+    def test_storage_key_with_uuid_is_not_redacted(self):
+        draft = self._make_valid_payload()
+        draft["schemaVersion"] = "1.5"
+        draft["attachments"] = [
+            {
+                "type": "storage",
+                "name": "recording.mp4",
+                "mimeType": "video/mp4",
+                "size": 1048576,
+                "sha256": "a" * 64,
+                "storageKey": "skill-feedback-attachments/2026/09/18/c95fce51-5081-43ba-bf61-1234567890ab/recording.mp4",
+            }
+        ]
+
+        sanitized = skill_feedback.sanitize_value(draft)
+
+        self.assertEqual(draft, sanitized)
+        self.assertIn(
+            "c95fce51-5081-43ba-bf61-1234567890ab",
+            sanitized["attachments"][0]["storageKey"],
+        )
 
 
 if __name__ == "__main__":
