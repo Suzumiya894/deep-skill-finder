@@ -59,7 +59,9 @@ APP_CONFIG_PATH = Path.home() / ".meyo_agent" / "app.config.json"
 
 # 附件上传配置
 ATTACHMENT_SIZE_THRESHOLD = 50 * 1024  # 50 KB；小于此值 inline base64，大于等于此值走服务端中转上传
-MAX_ATTACHMENT_SIZE = 100 * 1024 * 1024  # 100 MB 上限
+MAX_ATTACHMENT_SIZE = 100 * 1024 * 1024  # 100 MB 整体上限
+MAX_IMAGE_SIZE = 10 * 1024 * 1024        # 服务端对单张图片的限制
+MAX_VIDEO_SIZE = 100 * 1024 * 1024       # 服务端对单个视频的限制
 ATTACHMENT_UPLOAD_PATH = "/attachments/upload"
 ALLOWED_ATTACHMENT_MIME_PREFIXES = ("image/", "video/")
 # 部分 Agent runtime 的 mimetypes 数据库不完整，补一个常见图像/视频 fallback
@@ -564,6 +566,18 @@ def _process_attachments(
         if not any(mime.startswith(prefix) for prefix in ALLOWED_ATTACHMENT_MIME_PREFIXES):
             raise ValueError(
                 f"attachment must be image or video (got {mime}): {raw_path}"
+            )
+
+        # 按服务端类型限制做前置检查，给出更清晰的错误
+        if mime.startswith("image/") and size > MAX_IMAGE_SIZE:
+            raise RuntimeError(
+                f"image {raw_path} ({size} bytes) exceeds server limit "
+                f"({MAX_IMAGE_SIZE} bytes); please compress or resize before uploading"
+            )
+        if mime.startswith("video/") and size > MAX_VIDEO_SIZE:
+            raise RuntimeError(
+                f"video {raw_path} ({size} bytes) exceeds server limit "
+                f"({MAX_VIDEO_SIZE} bytes); please use a shorter clip"
             )
 
         sha256 = _sha256_file(path)
