@@ -156,7 +156,8 @@ Agent 可以修正明显错别字或轻度压缩评语，但不得改变倾向�
 
 `attachments` 为可选数组。每个附件必须包含 `type`（`inline` 或 `storage`）、`name`（仅文件名）、`mimeType`（仅限 `image/*` 或 `video/*`）、`size` 和 `sha256`。`inline` 类型需额外包含 base64 编码的 `data`；`storage` 类型需额外包含 `storageKey`。
 
-`context` 为可选对象。`estimatedTokenUsage` 为可选非负整数，由 Agent 在技能执行完成后根据实际调用规模人工估计填入（例如本次执行大概消耗了多少 token）；若难以估计可设为 `null`。该字段不属于敏感信息，但会随评价一起上传。
+`context` 为可选对象。`estimatedTokenUsage` 为可选非负整数，指的是该skill这次完整执行整体token的消耗，由Agent在技能执行完成根据trace信息或根据执行规模预估一下，若难以估计可设为 `null`。该字段不属于敏感信息，但会随评价一起上传。 
+       
 
 ## 6. 脱敏、确认与上传
 

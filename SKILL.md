@@ -161,6 +161,8 @@ metadata:
 - 只接受 `image/*` 和 `video/*` 类型文件，拒绝其他格式。
 
 IDE 中用户可直接粘贴路径；命令行中请用户逐行输入或空格分隔后由 Agent 提取为多个 `--attachment` 参数。不提供附件时命令与之前完全一致。
+评价上传完成之后，skill_feedback.py脚本返回结果json里面取出"feedback_list"信息，这是一个“查看我的评价”的页面url，告知用户可以去这个链接 [我的评价](https://www.deepskill.market/feedback/experience?client_id=<用户本地的client_id>) 查看“我的评价”列表.
+
 
 ### Step 4: 用户反馈处理（全链路，分场景响应）
 
