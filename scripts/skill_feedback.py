@@ -442,11 +442,12 @@ def _encode_inline_attachment(path: Path) -> dict[str, Any]:
 
 def _build_multipart_body(
     fields: dict[str, str],
-    files: dict[str, tuple[str, bytes, str]],
+    files: list[tuple[str, str, bytes, str]],
 ) -> tuple[bytes, str]:
     """构造 multipart/form-data 请求体。
 
-    files 格式: {field_name: (filename, content_bytes, mime_type)}
+    files 格式: [(field_name, filename, content_bytes, mime_type), ...]
+    支持同名字段重复出现（如多个 files）。
     返回: (body_bytes, boundary)
     """
     boundary = "----DeepSkillFinderBoundary" + uuid.uuid4().hex
@@ -458,7 +459,7 @@ def _build_multipart_body(
         lines.append(b"")
         lines.append(value.encode("utf-8"))
 
-    for name, (filename, content, mime_type) in files.items():
+    for name, filename, content, mime_type in files:
         lines.append(f"--{boundary}".encode())
         lines.append(
             f'Content-Disposition: form-data; name="{name}"; filename="{filename}"'.encode()
@@ -474,24 +475,31 @@ def _build_multipart_body(
     return body, boundary
 
 
-def _upload_attachment_via_server(
-    path: Path,
-    metadata: dict[str, Any],
+def _upload_attachments_via_server_batch(
+    items: list[tuple[Path, dict[str, Any]]],
     api_url: str,
     token: str,
     feedback_id: str,
-) -> dict[str, Any]:
-    """通过服务端中转接口上传大文件，返回服务端处理后的附件元数据。"""
+) -> dict[str, dict[str, Any]]:
+    """通过服务端中转接口批量上传大文件。
+
+    items: [(path, metadata), ...], metadata 包含 filename, mimeType, size, sha256
+    返回: {sha256: uploaded_metadata}
+    """
+    if not items:
+        return {}
+
     url = api_url.rstrip("/") + ATTACHMENT_UPLOAD_PATH
 
     fields = {}
     if feedback_id:
         fields["feedbackId"] = feedback_id
 
-    content = path.read_bytes()
-    files = {
-        "file": (metadata["filename"], content, metadata["mimeType"]),
-    }
+    files: list[tuple[str, str, bytes, str]] = []
+    for path, metadata in items:
+        content = path.read_bytes()
+        files.append(("files", metadata["filename"], content, metadata["mimeType"]))
+
     body, boundary = _build_multipart_body(fields, files)
 
     headers = {
@@ -520,16 +528,25 @@ def _upload_attachment_via_server(
                 raise RuntimeError(f"attachment upload failed: {message}")
 
             data = result.get("data")
-            if not isinstance(data, dict):
-                raise RuntimeError("attachment upload response missing data object")
+            if not isinstance(data, list):
+                raise RuntimeError("attachment upload response data must be an array")
+            if len(data) != len(items):
+                raise RuntimeError(
+                    f"attachment upload response count mismatch: expected {len(items)}, got {len(data)}"
+                )
 
             required = {"storageKey", "name", "mimeType", "size", "sha256"}
-            missing = required - set(data)
-            if missing:
-                raise RuntimeError(
-                    f"attachment upload response missing fields: {', '.join(missing)}"
-                )
-            return data
+            mapping: dict[str, dict[str, Any]] = {}
+            for index, item in enumerate(data):
+                if not isinstance(item, dict):
+                    raise RuntimeError(f"attachment upload response item[{index}] is not an object")
+                missing = required - set(item)
+                if missing:
+                    raise RuntimeError(
+                        f"attachment upload response item[{index}] missing fields: {', '.join(missing)}"
+                    )
+                mapping[item["sha256"]] = item
+            return mapping
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"attachment upload failed: HTTP {e.code} {e.reason}") from e
     except urllib.error.URLError as e:
@@ -543,8 +560,14 @@ def _process_attachments(
     feedback_id: str,
     allow_storage: bool = True,
 ) -> list[dict[str, Any]]:
-    """处理附件路径列表，返回可用于 payload 的 attachments 数组。"""
+    """处理附件路径列表，返回可用于 payload 的 attachments 数组。
+
+    小文件直接 inline；所有大文件会合并为一次服务端批量上传请求。
+    """
     attachments: list[dict[str, Any]] = []
+    large_items: list[tuple[Path, dict[str, Any]]] = []
+
+    # 第一轮：本地校验、分类、收集大文件
     for raw_path in paths:
         path = Path(raw_path).expanduser().resolve()
         if not path.exists():
@@ -596,9 +619,20 @@ def _process_attachments(
                     f"attachment {raw_path} ({size} bytes) exceeds inline threshold "
                     f"({ATTACHMENT_SIZE_THRESHOLD} bytes); use upload instead of submit"
                 )
-            uploaded = _upload_attachment_via_server(
-                path, metadata, api_url, token, feedback_id
-            )
+            large_items.append((path, metadata))
+
+    # 第二轮：一次性批量上传所有大文件
+    if large_items:
+        uploaded_map = _upload_attachments_via_server_batch(
+            large_items, api_url, token, feedback_id
+        )
+        for path, metadata in large_items:
+            uploaded = uploaded_map.get(metadata["sha256"])
+            if uploaded is None:
+                raise RuntimeError(
+                    f"attachment upload response missing result for {path.name} "
+                    f"(sha256: {metadata['sha256']})"
+                )
             attachments.append({
                 "type": "storage",
                 "name": uploaded["name"],
@@ -607,6 +641,7 @@ def _process_attachments(
                 "sha256": uploaded["sha256"],
                 "storageKey": uploaded["storageKey"],
             })
+
     return attachments
 
 

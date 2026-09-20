@@ -640,7 +640,10 @@ class SkillFeedbackTests(unittest.TestCase):
 
     def _make_large_attachment(self, temp_dir: str, size: int = 60 * 1024, suffix: str = ".mp4") -> Path:
         path = Path(temp_dir) / f"attachment{suffix}"
-        path.write_bytes(b"y" * size)
+        # Vary content by filename so multiple large files have unique sha256
+        seed = suffix.encode("utf-8")
+        payload = seed + b"y" * (size - len(seed))
+        path.write_bytes(payload)
         return path
 
     def test_validation_accepts_valid_inline_attachment(self):
@@ -819,14 +822,16 @@ class SkillFeedbackTests(unittest.TestCase):
 
             upload_response = {
                 "code": 200,
-                "data": {
-                    "storageKey": "skill-feedback-attachments/2026/09/18/client-id/fb-001/recording.mp4",
-                    "url": "https://mss.sankuai.com/mars-open-image/skill-feedback-attachments/2026/09/18/client-id/fb-001/recording.mp4",
-                    "name": "recording.mp4",
-                    "mimeType": "video/mp4",
-                    "size": 61440,
-                    "sha256": file_sha256,
-                },
+                "data": [
+                    {
+                        "storageKey": "skill-feedback-attachments/2026/09/18/client-id/fb-001/recording.mp4",
+                        "url": "https://mss.sankuai.com/mars-open-image/skill-feedback-attachments/2026/09/18/client-id/fb-001/recording.mp4",
+                        "name": "recording.mp4",
+                        "mimeType": "video/mp4",
+                        "size": 61440,
+                        "sha256": file_sha256,
+                    }
+                ],
             }
 
             feedback_resp = mock.MagicMock()
@@ -875,6 +880,234 @@ class SkillFeedbackTests(unittest.TestCase):
                 sent_body["attachments"][0]["storageKey"],
             )
             self.assertEqual("video/mp4", sent_body["attachments"][0]["mimeType"])
+
+    def test_upload_with_multiple_large_attachments_batch_uploads(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            draft_path = Path(temp_dir) / "draft.json"
+            attachment1 = self._make_large_attachment(temp_dir, suffix=".mp4")
+            attachment2 = self._make_large_attachment(temp_dir, suffix=".png")
+            sha1 = hashlib.sha256(attachment1.read_bytes()).hexdigest()
+            sha2 = hashlib.sha256(attachment2.read_bytes()).hexdigest()
+            payload = self._make_valid_payload()
+            payload["schemaVersion"] = "1.5"
+            draft_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            upload_response = {
+                "code": 200,
+                "data": [
+                    {
+                        "storageKey": "skill-feedback-attachments/2026/09/18/client-id/fb-001/recording.mp4",
+                        "name": "attachment.mp4",
+                        "mimeType": "video/mp4",
+                        "size": 61440,
+                        "sha256": sha1,
+                    },
+                    {
+                        "storageKey": "skill-feedback-attachments/2026/09/18/client-id/fb-001/screenshot.png",
+                        "name": "attachment.png",
+                        "mimeType": "image/png",
+                        "size": 61440,
+                        "sha256": sha2,
+                    },
+                ],
+            }
+
+            feedback_resp = mock.MagicMock()
+            feedback_resp.status = 200
+            feedback_resp.read.return_value = json.dumps({"ok": True}).encode()
+            feedback_resp.__enter__ = mock.MagicMock(return_value=feedback_resp)
+            feedback_resp.__exit__ = mock.MagicMock(return_value=False)
+
+            upload_url = skill_feedback.FEEDBACK_API_URL + skill_feedback.ATTACHMENT_UPLOAD_PATH
+            upload_call_count = 0
+
+            def urlopen_side_effect(req, **kwargs):
+                nonlocal upload_call_count
+                if req.full_url == upload_url:
+                    upload_call_count += 1
+                    upload_mock = mock.MagicMock()
+                    upload_mock.status = 200
+                    upload_mock.read.return_value = json.dumps(upload_response).encode()
+                    upload_mock.__enter__ = mock.MagicMock(return_value=upload_mock)
+                    upload_mock.__exit__ = mock.MagicMock(return_value=False)
+                    return upload_mock
+                return feedback_resp
+
+            with mock.patch.object(
+                skill_feedback.urllib.request,
+                "urlopen",
+                side_effect=urlopen_side_effect,
+            ) as mock_urlopen, contextlib.redirect_stdout(io.StringIO()):
+                args = argparse.Namespace(
+                    confirmed=True,
+                    input=str(draft_path),
+                    outbox=None,
+                    attachment=[str(attachment1), str(attachment2)],
+                )
+                exit_code = skill_feedback._command_upload(args)
+
+            self.assertEqual(0, exit_code)
+            self.assertEqual(1, upload_call_count)
+
+            feedback_calls = [
+                call for call in mock_urlopen.call_args_list
+                if call.args[0].full_url == skill_feedback.FEEDBACK_API_URL
+            ]
+            self.assertEqual(1, len(feedback_calls))
+            sent_body = json.loads(feedback_calls[0].args[0].data)
+            self.assertEqual(2, len(sent_body["attachments"]))
+            self.assertTrue(all(att["type"] == "storage" for att in sent_body["attachments"]))
+            self.assertEqual(
+                {"attachment.mp4", "attachment.png"},
+                {att["name"] for att in sent_body["attachments"]},
+            )
+
+    def test_upload_with_mixed_sizes_inlines_small_and_batches_large(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            draft_path = Path(temp_dir) / "draft.json"
+            small = self._make_small_attachment(temp_dir, size=100)
+            large = self._make_large_attachment(temp_dir)
+            large_sha = hashlib.sha256(large.read_bytes()).hexdigest()
+            payload = self._make_valid_payload()
+            payload["schemaVersion"] = "1.5"
+            draft_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            upload_response = {
+                "code": 200,
+                "data": [
+                    {
+                        "storageKey": "skill-feedback-attachments/2026/09/18/client-id/fb-001/recording.mp4",
+                        "name": "attachment.mp4",
+                        "mimeType": "video/mp4",
+                        "size": 61440,
+                        "sha256": large_sha,
+                    }
+                ],
+            }
+
+            feedback_resp = mock.MagicMock()
+            feedback_resp.status = 200
+            feedback_resp.read.return_value = json.dumps({"ok": True}).encode()
+            feedback_resp.__enter__ = mock.MagicMock(return_value=feedback_resp)
+            feedback_resp.__exit__ = mock.MagicMock(return_value=False)
+
+            upload_url = skill_feedback.FEEDBACK_API_URL + skill_feedback.ATTACHMENT_UPLOAD_PATH
+            upload_call_count = 0
+
+            def urlopen_side_effect(req, **kwargs):
+                nonlocal upload_call_count
+                if req.full_url == upload_url:
+                    upload_call_count += 1
+                    upload_mock = mock.MagicMock()
+                    upload_mock.status = 200
+                    upload_mock.read.return_value = json.dumps(upload_response).encode()
+                    upload_mock.__enter__ = mock.MagicMock(return_value=upload_mock)
+                    upload_mock.__exit__ = mock.MagicMock(return_value=False)
+                    return upload_mock
+                return feedback_resp
+
+            with mock.patch.object(
+                skill_feedback.urllib.request,
+                "urlopen",
+                side_effect=urlopen_side_effect,
+            ) as mock_urlopen, contextlib.redirect_stdout(io.StringIO()):
+                args = argparse.Namespace(
+                    confirmed=True,
+                    input=str(draft_path),
+                    outbox=None,
+                    attachment=[str(small), str(large)],
+                )
+                exit_code = skill_feedback._command_upload(args)
+
+            self.assertEqual(0, exit_code)
+            self.assertEqual(1, upload_call_count)
+
+            feedback_calls = [
+                call for call in mock_urlopen.call_args_list
+                if call.args[0].full_url == skill_feedback.FEEDBACK_API_URL
+            ]
+            sent_body = json.loads(feedback_calls[0].args[0].data)
+            types = {att["type"] for att in sent_body["attachments"]}
+            self.assertEqual({"inline", "storage"}, types)
+
+    def test_upload_batch_response_order_mismatch_maps_by_sha256(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            draft_path = Path(temp_dir) / "draft.json"
+            attachment1 = self._make_large_attachment(temp_dir, suffix=".mp4")
+            attachment2 = self._make_large_attachment(temp_dir, suffix=".png")
+            sha1 = hashlib.sha256(attachment1.read_bytes()).hexdigest()
+            sha2 = hashlib.sha256(attachment2.read_bytes()).hexdigest()
+            payload = self._make_valid_payload()
+            payload["schemaVersion"] = "1.5"
+            draft_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            # Server returns items in reverse order relative to request
+            upload_response = {
+                "code": 200,
+                "data": [
+                    {
+                        "storageKey": "skill-feedback-attachments/2026/09/18/client-id/fb-001/screenshot.png",
+                        "name": "attachment.png",
+                        "mimeType": "image/png",
+                        "size": 61440,
+                        "sha256": sha2,
+                    },
+                    {
+                        "storageKey": "skill-feedback-attachments/2026/09/18/client-id/fb-001/recording.mp4",
+                        "name": "attachment.mp4",
+                        "mimeType": "video/mp4",
+                        "size": 61440,
+                        "sha256": sha1,
+                    },
+                ],
+            }
+
+            feedback_resp = mock.MagicMock()
+            feedback_resp.status = 200
+            feedback_resp.read.return_value = json.dumps({"ok": True}).encode()
+            feedback_resp.__enter__ = mock.MagicMock(return_value=feedback_resp)
+            feedback_resp.__exit__ = mock.MagicMock(return_value=False)
+
+            upload_url = skill_feedback.FEEDBACK_API_URL + skill_feedback.ATTACHMENT_UPLOAD_PATH
+
+            def urlopen_side_effect(req, **kwargs):
+                if req.full_url == upload_url:
+                    upload_mock = mock.MagicMock()
+                    upload_mock.status = 200
+                    upload_mock.read.return_value = json.dumps(upload_response).encode()
+                    upload_mock.__enter__ = mock.MagicMock(return_value=upload_mock)
+                    upload_mock.__exit__ = mock.MagicMock(return_value=False)
+                    return upload_mock
+                return feedback_resp
+
+            with mock.patch.object(
+                skill_feedback.urllib.request,
+                "urlopen",
+                side_effect=urlopen_side_effect,
+            ) as mock_urlopen, contextlib.redirect_stdout(io.StringIO()):
+                args = argparse.Namespace(
+                    confirmed=True,
+                    input=str(draft_path),
+                    outbox=None,
+                    attachment=[str(attachment1), str(attachment2)],
+                )
+                exit_code = skill_feedback._command_upload(args)
+
+            self.assertEqual(0, exit_code)
+            feedback_calls = [
+                call for call in mock_urlopen.call_args_list
+                if call.args[0].full_url == skill_feedback.FEEDBACK_API_URL
+            ]
+            sent_body = json.loads(feedback_calls[0].args[0].data)
+            attachments_by_name = {att["name"]: att for att in sent_body["attachments"]}
+            self.assertEqual(
+                "skill-feedback-attachments/2026/09/18/client-id/fb-001/recording.mp4",
+                attachments_by_name["attachment.mp4"]["storageKey"],
+            )
+            self.assertEqual(
+                "skill-feedback-attachments/2026/09/18/client-id/fb-001/screenshot.png",
+                attachments_by_name["attachment.png"]["storageKey"],
+            )
 
     def test_upload_attachment_not_found_returns_two(self):
         with tempfile.TemporaryDirectory() as temp_dir:
